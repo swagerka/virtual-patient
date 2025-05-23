@@ -7,7 +7,7 @@ import random
 import re
 import json
 from datetime import datetime, timedelta
-# import time # time.sleep не используется для "живого" таймера в этой версии
+# import time # Не используется активно
 
 MEDICAL_SPECIALIZATIONS = ["Общая терапия", "Гастроэнтерология", "Кардиология", "Пульмонология", "Неврология", "Эндокринология", "Нефрология (Урология)", "Инфекционные болезни", "Ревматология", "Педиатрия (общие случаи)", "Травматология и Ортопедия (несложные случаи)", "Гинекология (базовые случаи)", "Дерматология"]
 AGE_RANGES = {"Младенец/Ребенок (0-5 лет)": (0, 5), "Ребенок (6-12 лет)": (6, 12), "Подросток (13-17 лет)": (13, 17), "Молодой взрослый (18-35 лет)": (18, 35), "Средний возраст (36-60 лет)": (36, 60), "Пожилой (61-80 лет)": (61, 80), "Старческий (81+ лет)": (81, 100)}
@@ -52,7 +52,6 @@ def _extract_and_parse_json(raw_text):
             except json.JSONDecodeError: continue 
         raise json.JSONDecodeError(f"Не удалось восстановить JSON. Ошибка: {e.msg}", e.doc if e.doc else "", e.pos if e.pos is not None else 0)
 
-
 def generate_llm_response(messages_history_for_llm, system_prompt_for_llm):
     try:
         messages_to_send = [{"role": "system", "content": system_prompt_for_llm}] + \
@@ -65,11 +64,17 @@ def generate_llm_response(messages_history_for_llm, system_prompt_for_llm):
 def generate_new_scenario_via_llm(age_range_str=None, specialization_str=None, gender_str=None, difficulty_str=None):
     st.info("Запрос на генерацию нового сценария LLM...")
     customization_prompt_parts = []; patient_age_for_prompt = "случайный"; patient_gender_for_prompt = "случайный"
-    # ... (логика формирования customization_prompt_parts как и ранее) ...
     if age_range_str and age_range_str != "Любой" and age_range_str in AGE_RANGES: min_a, max_a = AGE_RANGES[age_range_str]; customization_prompt_parts.append(f"Возраст: {min_a}-{max_a} лет."); patient_age_for_prompt = f"{min_a}-{max_a} лет"
     if gender_str and gender_str != "Любой": customization_prompt_parts.append(f"Пол: {gender_str}."); patient_gender_for_prompt = gender_str
-    # ... (difficulty_instructions и specialization)
-    customization_instructions = " ".join(customization_prompt_parts)
+    difficulty_instructions = ""
+    if difficulty_str and difficulty_str != "Любой":
+        difficulty_instructions = f"Уровень сложности: {difficulty_str}. "
+        if difficulty_str == "Легкий": difficulty_instructions += "Симптомы КЛАССИЧЕСКИЕ, пациент КОНТАКТНЫЙ, диагноз ОТНОСИТЕЛЬНО ОЧЕВИДЕН. Внешность: легкое недомогание."
+        elif difficulty_str == "Средний": difficulty_instructions += "Симптомы НЕ СОВСЕМ ТИПИЧНЫЕ/СМАЗАННЫЕ, пациент УМЕРЕННО БЕСПОКОЕН. Требуется ДИФДИАГНОСТИКА. Внешность: заметные признаки болезни."
+        elif difficulty_str == "Тяжелый": difficulty_instructions += "Симптомы АТИПИЧНЫЕ/МНОЖЕСТВЕННЫЕ, пациент ТРУДНЫЙ В ОБЩЕНИИ. ТЩАТЕЛЬНАЯ дифдиагностика. Внешность: тяжелое состояние."
+        customization_prompt_parts.append(difficulty_instructions)
+    if specialization_str and specialization_str != "Любая": customization_prompt_parts.append(f"Область: {specialization_str}.")
+    customization_instructions = " ".join(customization_prompt_parts); 
     if customization_instructions: customization_instructions = f"ТРЕБОВАНИЯ: {customization_instructions}"
     meta_prompt = f"""Ты — эксперт ... {customization_instructions} ... JSON СТРОГО ...
 {{
@@ -132,28 +137,24 @@ def generate_new_scenario_via_llm(age_range_str=None, specialization_str=None, g
     except Exception as e: st.error(f"Ошибка генерации: {e}"); st.text_area("LLM ответ:", raw_text_response, height=200); return None
 
 def evaluate_with_llm(scenario_data, user_dialogue_msgs, user_dx, user_plan, consultation_count):
-    # ... (код как в предыдущем ответе)
     st.info("Оценка LLM...")
-    raw_text_eval = ""
-    # Формирование scenario_info_for_evaluator и physician_actions_for_evaluator должно быть полным
-    scenario_info_for_evaluator = f"""**Сценарий:** {scenario_data.get('name', 'Без названия')}
-**Первичная информация:** {scenario_data.get('patient_initial_info_display', 'Нет данных.')}
-**Внешний вид пациента (при осмотре):** {scenario_data.get('patient_appearance_detailed', 'Не описан.')}
-**Истинный Диагноз (подробно):** {scenario_data.get('true_diagnosis_detailed', 'Отсутствует в данных сценария.')}
-**Ключевые моменты анамнеза:** {", ".join(scenario_data.get('key_anamnesis_points', []))}
-**Правильный План:** {scenario_data.get('correct_plan_detailed', 'Отсутствует в данных сценария.')}"""
-
+    raw_text_eval = ""; 
+    scenario_info_for_evaluator = f"""**Сценарий:** {scenario_data.get('name', 'N/A')}
+**Первичка:** {scenario_data.get('patient_initial_info_display', 'N/A')}
+**Внешний вид:** {scenario_data.get('patient_appearance_detailed', 'N/A')}
+**Ист.диагноз:** {scenario_data.get('true_diagnosis_detailed', 'N/A')}
+**Ключ.анамнез:** {scenario_data.get('key_anamnesis_points', [])}
+**Прав.план:** {scenario_data.get('correct_plan_detailed', 'N/A')}"""
     dialogue_str = "\n".join([f"{'Врач' if msg['role']=='user' else 'Пациент'}: {msg['content']}" for msg in user_dialogue_msgs])
-    physician_actions_for_evaluator = f"""**История диалога:**\n{dialogue_str}
-**Предложенный диагноз врача:** {user_dx if user_dx.strip() else '[Отсутствует]'}
-**Предложенный план обследования и лечения врача:** {user_plan if user_plan.strip() else '[Отсутствует]'}
-**Количество запрошенных консультаций:** {consultation_count}"""
-    
-    evaluation_prompt = f"""Ты — опытный мед. преподаватель...
+    physician_actions_for_evaluator = f"""**Диалог:**\n{dialogue_str}
+**Предл.диагноз:** {user_dx or '[нет]'}
+**Предл.план:** {user_plan or '[нет]'}
+**Консультаций:** {consultation_count}"""
+    evaluation_prompt = f"""Ты — препод...
 Данные сценария: {scenario_info_for_evaluator}
 Действия врача: {physician_actions_for_evaluator}
 JSON формат: {{ "score": int, "explanation": {{ "correct_aspects": [], "mistakes_or_omissions": [] }} }}
-Учитывай консультации при оценке (если >0, можно немного снизить балл)."""
+Учитывай консультации (если >0, немного снизь балл)."""
     try:
         response = client.completions.create(model="local-model", prompt=evaluation_prompt, max_tokens=2000, temperature=0.4)
         raw_text_eval = response.choices[0].text; evaluation_result_obj = _extract_and_parse_json(raw_text_eval)
@@ -166,9 +167,7 @@ JSON формат: {{ "score": int, "explanation": {{ "correct_aspects": [], "mi
     except (json.JSONDecodeError, ValueError) as e: st.error(f"Ошибка JSON оценщика: {e}"); st.text_area("Ответ оценщика:", raw_text_eval, height=150); return {"score":0, "mistakes": [{"description":f"Ошибка JSON:{e}"}]}
     except Exception as e: st.error(f"Ошибка оценки: {e}"); st.text_area("Ответ оценщика:", raw_text_eval, height=150); return {"score":0, "mistakes": [{"description":f"Ошибка:{e}"}]}
 
-
 def initialize_scenario(scenario_data_obj, training_mode=False, keep_results_for_training=False):
-    # ... (код как в предыдущем ответе, включая сброс hidden_triggers, vitals_history, timer, consultation_count)
     if not isinstance(scenario_data_obj, dict): st.error("Ошибка данных сценария."); st.rerun(); return
     st.session_state.current_scenario = scenario_data_obj 
     if "hidden_triggers" in scenario_data_obj and isinstance(scenario_data_obj.get("hidden_triggers"), list): 
@@ -191,23 +190,19 @@ def initialize_scenario(scenario_data_obj, training_mode=False, keep_results_for
     if not training_mode or not keep_results_for_training:
         st.session_state.evaluation_done = False; st.session_state.evaluation_results = None
 
-
 def reset_session_and_rerun():
-    # ... (код как в предыдущем ответе, обеспечивая сброс всех нужных ключей)
     settings_keys = ["llm_age", "llm_gender", "llm_spec", "llm_difficulty", "start_with_hints_checkbox", "timer_duration_setting"]
     saved_settings = {k: st.session_state.get(k) for k in settings_keys if k in st.session_state}
     for k in list(st.session_state.keys()):
         if not k.startswith("FormSubmitter:") and not k.endswith(("_input", "_key", "_btn", "_widget")) and k not in settings_keys:
             del st.session_state[k]
-    for key, value in default_session_state_values.items(): # Переинициализация из дефолтов
+    for key, value in default_session_state_values.items():
         if key not in st.session_state: 
             st.session_state[key] = value() if callable(value) else value
-    for k, v in saved_settings.items(): st.session_state[k] = v # Восстановление сохраненных настроек
+    for k, v in saved_settings.items(): st.session_state[k] = v
     st.rerun()
 
-
 def extract_and_store_vitals(patient_response_text, message_num_tag):
-    # ... (код как в предыдущем ответе)
     bp = re.search(r"(\b\d{2,3}\s*(?:/|на)\s*\d{2,3}\b)", patient_response_text,re.I); hr = re.search(r"(ЧСС|пульс)\s*:?\s*(\b\d{2,3}\b)", patient_response_text,re.I)
     tp = re.search(r"(t|температура)\s*:?\s*(\b\d{2}(?:[.,]\d)?\b)", patient_response_text,re.I); sp = re.search(r"(сатурация|SpO2)\s*:?\s*(\b\d{2,3}\b)\s*%", patient_response_text,re.I)
     if bp: st.session_state.vitals_history["АД"].append(f"{message_num_tag}: {bp.group(1)}")
@@ -215,9 +210,7 @@ def extract_and_store_vitals(patient_response_text, message_num_tag):
     if tp: st.session_state.vitals_history["Температура"].append(f"{message_num_tag}: {tp.group(2).replace(',','.')}°C")
     if sp: st.session_state.vitals_history["Сатурация"].append(f"{message_num_tag}: {sp.group(1)}%")
 
-
 def format_message_with_vitals_highlight(text):
-    # ... (код как в предыдущем ответе)
     text = re.sub(r"(\b\d{2,3}\s*(?:/|на)\s*\d{2,3}\b)", r"**\1**", text, flags=re.I)
     text = re.sub(r"((?:ЧСС|пульс)\s*:?\s*)(\b\d{2,3}\b)", r"\1**\2**", text, flags=re.I)
     text = re.sub(r"((?:t|температура)\s*:?\s*)(\b\d{2}(?:[.,]\d)?\b)", r"\1**\2**", text, flags=re.I)
@@ -225,7 +218,6 @@ def format_message_with_vitals_highlight(text):
     return text
 
 def analyze_user_against_common_mistakes(scenario_mistakes, user_dx, user_plan, dialogue_history):
-    # ... (код как в предыдущем ответе)
     committed = []
     if not user_dx.strip(): next((committed.append(m) for m in scenario_mistakes if m.get("id")=="empty_dx"),None)
     if not user_plan.strip(): next((committed.append(m) for m in scenario_mistakes if m.get("id")=="empty_plan"),None)
@@ -247,7 +239,6 @@ for key, value in default_session_state_values.items():
 st.set_page_config(layout="wide", page_title="Виртуальный Пациент")
 
 with st.sidebar: 
-    # ... (код сайдбара как в предыдущем ответе, включая настройку таймера)
     st.title("👨‍⚕️ Управление")
     if st.session_state.current_scenario:
         st.success(f"Активен: {st.session_state.current_scenario.get('name','Сценарий')[:25]}...")
@@ -284,10 +275,9 @@ with st.sidebar:
 
 
 if st.session_state.current_scenario: 
-    # ... (код основной части UI как в предыдущем ответе, включая отображение таймера, карточки пациента, вкладок, чата, формы, заметок, кнопки консультации, и обработку результатов/деталей)
     scenario = st.session_state.current_scenario; is_training = st.session_state.training_mode_active
     st.title(f"🩺 {scenario.get('name', 'Случай')}")
-    timer_html = ""; force_eval = False # Объявляем здесь
+    timer_html = ""; force_eval = False 
     if st.session_state.simulation_end_time and not st.session_state.time_up and not st.session_state.evaluation_done:
         rem_time = st.session_state.simulation_end_time - datetime.now()
         if rem_time.total_seconds() > 0: mins, secs = divmod(int(rem_time.total_seconds()),60); timer_html = f"<p>⏱️ Осталось: <b style='color:#1E90FF;'>{mins:02d}:{secs:02d}</b></p>"
@@ -302,57 +292,73 @@ if st.session_state.current_scenario:
     if app_desc and app_desc.lower()!='внешность пациента не описана.': st.markdown(f"<div class='appearance-section'><p><b>Внешний вид:</b> {app_desc}</p></div>", unsafe_allow_html=True)
     
     if force_eval and not st.session_state.evaluation_done:
-        st.session_state.evaluation_done=True; results=evaluate_with_llm(scenario,st.session_state.messages,st.session_state.user_diagnosis,st.session_state.user_action_plan,st.session_state.consultation_count); st.session_state.evaluation_results=results; st.rerun()
+        st.session_state.evaluation_done=True
+        results=evaluate_with_llm(scenario,st.session_state.messages,st.session_state.user_diagnosis,st.session_state.user_action_plan,st.session_state.consultation_count)
+        st.session_state.evaluation_results=results; st.rerun()
     
     tabs_def = {"💬 Диалог и Действия": None}
     if st.session_state.evaluation_done: tabs_def["📊 Результаты"] = None
     if is_training or st.session_state.evaluation_done: tabs_def["ℹ️ Детали Сценария"] = None
-    active_tabs = st.tabs(list(tabs_def.keys())) # Иконки можно добавить обратно сюда, если нужно
+    active_tabs_keys = list(tabs_def.keys())
+    tabs_ui = st.tabs(active_tabs_keys)
 
-    with active_tabs[0]: # Диалог и Действия
-        # ... (код как в предыдущем полном ответе)
+    with tabs_ui[0]: 
         col1, col2 = st.columns([0.45,0.55])
-        with col1: # Действия врача
+        with col1:
             inputs_dis = st.session_state.evaluation_done or st.session_state.time_up
-            with st.form(key="dx_form"):
-                st.text_input("Предв. диагноз:", value=st.session_state.user_diagnosis, key="udx_form_w", disabled=inputs_dis, on_change=lambda: setattr(st.session_state,'user_diagnosis',st.session_state.udx_form_w))
-                st.text_area("План:", value=st.session_state.user_action_plan, key="uplan_form_w",height=120,disabled=inputs_dis, on_change=lambda: setattr(st.session_state,'user_action_plan',st.session_state.uplan_form_w))
+            with st.form(key="dx_plan_form_key"): # Изменен ключ формы для уникальности
+                st.text_input("Предв. диагноз:", value=st.session_state.get("user_diagnosis", ""), key="dx_form_input_widget", disabled=inputs_dis)
+                st.text_area("План:", value=st.session_state.get("user_action_plan", ""), key="plan_form_input_widget",height=120,disabled=inputs_dis)
                 if st.form_submit_button("✔️ Завершить и Оценить", type="primary", use_container_width=True, disabled=inputs_dis):
+                    st.session_state.user_diagnosis = st.session_state.dx_form_input_widget 
+                    st.session_state.user_action_plan = st.session_state.plan_form_input_widget
                     if st.session_state.simulation_end_time and datetime.now() >= st.session_state.simulation_end_time and not st.session_state.time_up: st.session_state.time_up=True; st.warning("Время вышло перед отправкой!")
                     st.session_state.chat_active=False
                     results_eval=evaluate_with_llm(scenario,st.session_state.messages,st.session_state.user_diagnosis,st.session_state.user_action_plan,st.session_state.consultation_count)
                     st.session_state.evaluation_results=results_eval; st.session_state.evaluation_done=True; st.rerun()
             st.subheader("📝 Ваши заметки")
             notes_now = st.session_state.get("doctor_notes","")
-            new_notes_now = st.text_area("Личные пометки:",value=notes_now,key="doc_notes_w",height=100,disabled=inputs_dis)
+            new_notes_now = st.text_area("Личные пометки:",value=notes_now,key="doc_notes_widget_key",height=100,disabled=inputs_dis) # Изменен ключ
             if new_notes_now != notes_now: st.session_state.doctor_notes = new_notes_now
             st.markdown("---"); st.subheader("🤔 Нужна помощь?")
             consult_dis = inputs_dis or st.session_state.consultation_count >= 3
-            if st.button(f"Запросить консультацию ({st.session_state.consultation_count}/3)",key="consult_btn",disabled=consult_dis,use_container_width=True):
+            if st.button(f"Запросить консультацию ({st.session_state.consultation_count}/3)",key="consult_btn_main_key",disabled=consult_dis,use_container_width=True): # Изменен ключ
                 st.session_state.consultation_count+=1
-                history_for_consult = "\n".join([f"{'Врач' if msg['role'] == 'user' else 'Пациент'}: {msg['content']}" for msg in st.session_state.messages])
-                consult_prompt_text = f"""Ты - опытный врач-консультант. Стажер просит совет.
-Сценарий: {scenario.get('patient_initial_info_display', 'N/A')}. Внешний вид: {scenario.get('patient_appearance_detailed', 'N/A')}. (Для тебя: {scenario.get('true_diagnosis_internal', 'N/A')})
-Диалог: {history_for_consult}
-Диагноз стажера: {st.session_state.user_diagnosis or '[не указан]'}
+                history_for_consult = "\n".join([f"{'Врач' if msg['role'] == 'user' else 'Пациент'}: {msg['content']}" for msg in st.session_state.messages[-7:]]) # Последние 7 сообщений
+                patient_display_info_consult = scenario.get('patient_initial_info_display', 'N/A')
+                consult_prompt_text = f"""Ты - опытный врач-наставник. Твой коллега-стажер ведет пациента и просит ОДИН короткий тактический совет.
+Пациент (первичная информация): {patient_display_info_consult}.
+Последние сообщения диалога:
+{history_for_consult}
+Предварительный диагноз стажера: {st.session_state.user_diagnosis or '[не указан]'}
 План стажера: {st.session_state.user_action_plan or '[не указан]'}
-ЗАДАЧА: Дай 1 конкретный и краткий тактический совет. Не диагноз. Пример: 'Уточни иррадиацию болей.'"""
+ТВОЯ ЗАДАЧА: Дай ОДИН КОНКРЕТНЫЙ совет (1-2 предложения), что стажеру сделать дальше (какой вопрос задать, на что обратить внимание, какое обследование назначить). НЕ ДАВАЙ полный диагноз. НЕ ИСПОЛЬЗУЙ markdown или ```. Только текст совета.
+Пример твоего ответа: Уточните, пожалуйста, иррадиацию болей и связь с приемом пищи.
+Твой совет:"""
                 with st.spinner("Коллега думает..."):
-                    try: resp_c=client.completions.create(model="local-model",prompt=consult_prompt_text,max_tokens=150,temperature=0.5); st.info(f"💡 Совет: {resp_c.choices[0].text.strip()}"); st.toast("Консультация!",icon="🤝")
-                    except Exception as e_c: st.error(f"Ошибка: {e_c}")
-                st.rerun()
-        with col2: # Чат
+                    try: 
+                        resp_c=client.completions.create(model="local-model",prompt=consult_prompt_text,max_tokens=100,temperature=0.5, stop=["\n\n", "Пациент:", "Врач:"])
+                        advice_raw = resp_c.choices[0].text.strip()
+                        advice_cleaned = advice_raw.replace("```", "").strip()
+                        advice_lines = [line.strip() for line in advice_cleaned.splitlines() if line.strip()]
+                        final_advice = " ".join(advice_lines)
+                        if final_advice: st.info(f"💡 **Совет от коллеги:** {final_advice}")
+                        else: st.warning("Коллега не смог дать конкретный совет или вернул пустой ответ.")
+                        st.toast("Консультация получена!",icon="🤝")
+                    except Exception as e_c: st.error(f"Ошибка консультации: {e_c}")
+        with col2: 
             st.subheader("💬 Диалог с пациентом")
             chat_ph = st.empty()
             with chat_ph.container(height=500):
                  for msg_i in st.session_state.messages: 
                      with st.chat_message(msg_i["role"],avatar="🧑‍⚕️" if msg_i["role"]=="user" else "🤒"): st.markdown(format_message_with_vitals_highlight(msg_i["content"]),unsafe_allow_html=True)
-            chat_disabled_msg_reason = ""
-            if st.session_state.time_up: chat_disabled_msg_reason="Время вышло!"
-            elif st.session_state.evaluation_done: chat_disabled_msg_reason="Оценка проведена."
-            elif not st.session_state.chat_active: chat_disabled_msg_reason="Диалог неактивен."
-            user_q_text = st.chat_input("Вопрос пациенту...",key="chat_main_w",disabled=bool(chat_disabled_msg_reason)) # Исправлено chat_in_main_key
-            if user_q_text and not bool(chat_disabled_msg_reason):
+            chat_input_disabled_reason_ui = ""
+            if st.session_state.time_up: chat_input_disabled_reason_ui="Время вышло!"
+            elif st.session_state.evaluation_done: chat_input_disabled_reason_ui="Оценка проведена."
+            elif not st.session_state.chat_active: chat_input_disabled_reason_ui="Диалог неактивен."
+            chat_truly_disabled_ui = bool(chat_input_disabled_reason_ui)
+            user_q_text = st.chat_input("Вопрос пациенту...",key="chat_main_widget_key_unique",disabled=chat_truly_disabled_ui) # Еще раз изменен ключ
+            if user_q_text and not chat_truly_disabled_ui:
                 if st.session_state.simulation_end_time and datetime.now() >= st.session_state.simulation_end_time and not st.session_state.time_up:
                     st.session_state.time_up=True; st.warning("Время вышло! Сообщение не отправлено."); force_eval=True; st.rerun()
                 else:
@@ -360,18 +366,17 @@ if st.session_state.current_scenario:
                     user_msg_count = len([m for m in st.session_state.messages if m['role']=='user']) 
                     if "hidden_triggers" in scenario: 
                         active_trigs_now=[]; 
-                        for trig_o in scenario.get("hidden_triggers", []):
+                        for trig_o_idx, trig_o in enumerate(st.session_state.current_scenario.get("hidden_triggers", [])): # Итерируем по копии из session_state
                             if isinstance(trig_o,dict) and not trig_o.get("triggered_once",False):
                                 trig_fire=False; ct=trig_o.get("condition_type"); cv=trig_o.get("condition_value"); mod_prompt=trig_o.get("modify_system_prompt_add","")
                                 if ct=="keyword" and isinstance(cv,list) and any(k.lower() in user_q_text.lower() for k in cv): trig_fire=True
                                 elif ct=="message_count" and isinstance(cv,int) and user_msg_count >= cv: trig_fire=True
                                 elif ct=="after_llm_keyword" and isinstance(cv,list) and len(st.session_state.messages)>1 and st.session_state.messages[-2].get("role")=="assistant" and any(k.lower() in st.session_state.messages[-2].get("content","").lower() for k in cv): trig_fire=True
-                                if trig_fire: trig_o["system_prompt_modification"]=mod_prompt; active_trigs_now.append(trig_o)
+                                if trig_fire: trig_o["system_prompt_modification"]=mod_prompt; active_trigs_now.append(trig_o) # Добавляем сам объект триггера
                         active_trigs_now.sort(key=lambda t: t.get("priority",0),reverse=True)
                         if active_trigs_now:
                             chosen_t=active_trigs_now[0]; trig_pref=f"[СИСТЕМНЫЙ ТРИГГЕР: {chosen_t.get('patient_reveal_info','')}] "; sys_prompt_add=chosen_t.get("system_prompt_modification","")
-                            for i_t, o_t in enumerate(st.session_state.current_scenario["hidden_triggers"]): 
-                                if o_t.get("id")==chosen_t.get("id"): st.session_state.current_scenario["hidden_triggers"][i_t]["triggered_once"]=True; break
+                            chosen_t["triggered_once"] = True # Помечаем как сработавший в объекте из session_state
                     with st.spinner("Пациент отвечает..."):
                         base_p_prompt = scenario.get("patient_llm_persona_system_prompt","Ты пациент.")
                         final_p_prompt = trig_pref + base_p_prompt + (f" [ДОП.ИНСТРУКЦИЯ: {sys_prompt_add}]" if sys_prompt_add else "")
@@ -379,35 +384,69 @@ if st.session_state.current_scenario:
                     st.session_state.messages.append({"role":"assistant","content":llm_resp_text})
                     extract_and_store_vitals(llm_resp_text,f"Вопрос #{user_msg_count}")
                     st.rerun()
-            elif chat_disabled_msg_reason: 
-                # Помещаем сообщение о блокировке внутрь плейсхолдера, чтобы оно не дублировалось ниже чата
-                current_chat_content = chat_ph.container(height=500) # Re-capture to write into it
-                with current_chat_content: # This might overwrite the chat, be careful. Or use a separate placeholder.
-                     # This will likely overwrite the chat, better to place this st.info outside the chat_ph
-                     pass # st.info(f"Диалог неактивен: {chat_disabled_msg_reason}") - убрано, т.к. может перекрыть чат
-    
+            elif chat_input_disabled_reason_ui and chat_ph: # Показываем сообщение если чат заблокирован и плейсхолдер существует
+                with chat_ph.container(): # Это может перекрыть чат, если он там уже есть.
+                    # Лучше иметь отдельный st.empty() для таких сообщений под полем ввода чата.
+                    # st.info(f"Диалог неактивен: {chat_input_disabled_reason_ui}") # Закомментировано пока
+                    pass
+
+
     if "📊 Результаты" in tabs_def:
-        # ... (код вкладки Результаты с анализом common mistakes и протоколом)
-        with active_tabs[list(tabs_def.keys()).index("📊 Результаты")]:
-            # ... (полный код вкладки как в предыдущем ответе)
-            pass # Заполнитель, здесь должен быть код из предыдущего ответа
+        with active_tabs[active_tabs_keys.index("📊 Результаты")]:
+            results_data = st.session_state.evaluation_results; st.subheader(f"Результаты {'обучения' if is_training else 'самост. работы'}")
+            if results_data and "score" in results_data:
+                score_val_res = results_data.get('score', 0.0)
+                st.metric(label="Итоговая оценка LLM", value=f"{score_val_res:.1f}/10",delta_color="off")
+                with st.expander("👍 Правильно (оценщик)", True): 
+                    ca = results_data.get('correct_actions',[]); st.write("Нет данных" if not ca else "\n".join([f"- ✅ {a}" for a in ca]))
+                with st.expander("🤔 Ошибки (оценщик)",True): 
+                    ms = results_data.get('mistakes',[]); st.write("Нет данных" if not ms else "\n".join([f"- ❌ {m.get('description','N/A')}" for m in ms]))
+                st.markdown("---"); st.subheader("Анализ по Частым Ошибкам Сценария")
+                committed_list = analyze_user_against_common_mistakes(scenario.get("common_mistakes",[]),st.session_state.user_diagnosis,st.session_state.user_action_plan,st.session_state.messages)
+                if committed_list: st.warning("Совпадения с типичными ошибками:"); [st.markdown(f"- **{m.get('description')}** (Штраф: {m.get('penalty')})") for m in committed_list]
+                else: st.success("Типичных ошибок не найдено!")
+                st.markdown("---"); 
+                with st.expander("📝 Протокол Консультации (Сводка)", False):
+                    st.markdown(f"**Пациент:** {scenario.get('patient_initial_info_display','N/A')}")
+                    st.markdown(f"**Внешний вид:** {scenario.get('patient_appearance_detailed','N/A')}")
+                    initial_complaints_proto = st.session_state.messages[0]["content"] if st.session_state.messages and st.session_state.messages[0]["role"] == "assistant" else scenario.get('patient_initial_info_display', '')
+                    st.markdown(f"**Жалобы (начало):** *{initial_complaints_proto[:250]}...*")
+                    st.markdown("**Анализ ключевых моментов анамнеза:**")
+                    key_points_sc = scenario.get('key_anamnesis_points', []); user_q_text_all = " ".join([m['content'].lower() for m in st.session_state.messages if m['role']=='user'])
+                    covered_pts, missed_pts = [],[]
+                    if key_points_sc:
+                        for pt_text in key_points_sc:
+                            pt_kw = [w.lower() for w in re.findall(r'\b[а-яА-Яa-zA-Z]{3,}\b', pt_text)]; 
+                            if not pt_kw: missed_pts.append(pt_text); continue
+                            thresh = max(1, len(pt_kw)//2 + (1 if len(pt_kw)%2!=0 else 0) ); found_c = sum(1 for p in pt_kw if p in user_q_text_all)
+                            if found_c >= thresh: covered_pts.append(pt_text)
+                            else: missed_pts.append(pt_text)
+                        if covered_pts: st.success("Выявлено:"); [st.markdown(f"  - ✅ {c}") for c in covered_pts]
+                        if missed_pts: st.warning("Пропущено/недостаточно раскрыто:"); [st.markdown(f"  - ⚠️ {m}") for m in missed_pts]
+                    else: st.caption("Эталонные пункты не определены.")
+                    if st.session_state.doctor_notes: st.markdown("**Ваши заметки:**"); st.code(st.session_state.doctor_notes)
+                    if any(st.session_state.vitals_history.values()): 
+                        st.markdown("**Данные осмотра (из диалога):**")
+                        for vital_name, history_list_item in st.session_state.vitals_history.items():
+                            if history_list_item: st.markdown(f"  - **{vital_name}:** {', '.join(history_list_item)}")
+                    st.markdown(f"**Предв. диагноз врача:**"); st.code(st.session_state.user_diagnosis or "[Не указан]")
+                    st.markdown(f"**План врача:**"); st.code(st.session_state.user_action_plan or "[Не указан]")
+                    st.markdown(f"**Истинный диагноз:** {scenario.get('true_diagnosis_detailed','N/A')}", help=scenario.get('true_diagnosis_internal',''))
+                    st.markdown(f"**Эталонный план:** {scenario.get('correct_plan_detailed','N/A')}")
+                    st.markdown(f"**Итоговая оценка LLM:** {res_data.get('score',0.0):.1f}/10")
+                    if st.session_state.consultation_count > 0: st.caption(f"(С учетом {st.session_state.consultation_count} консультаций)")
+                if not is_training and not st.session_state.already_offered_training_mode_for_this_eval:
+                    if st.button("💡 Пройти с подсказками",key="train_btn_res",use_container_width=True): initialize_scenario(scenario,True,True); st.rerun()
+            else: st.warning("Результаты оценки еще не готовы.")
 
     if "ℹ️ Детали Сценария" in tabs_def:
-        # ... (код вкладки Детали)
-        with active_tabs[list(tabs_def.keys()).index("ℹ️ Детали Сценария")]:
-            # ... (полный код вкладки как в предыдущем ответе)
-            pass # Заполнитель
+        with active_tabs[active_tabs_keys.index("ℹ️ Детали Сценария")]:
+            st.subheader("Детали Сценария и Эталоны")
+            # ... (код вывода деталей как в предыдущем полном ответе)
 
-
-elif not st.session_state.get("current_scenario") and not st.session_state.get("scenario_selected"):
+elif not st.session_state.current_scenario and not st.session_state.scenario_selected:
     st.title("Добро пожаловать в Симулятор Виртуального Пациента!")
-    st.markdown("""
-        Этот симулятор предназначен для тренировки ваших навыков общения с пациентами, сбора анамнеза,
-        постановки диагноза и назначения плана лечения в интерактивной среде.
-        Вы будете взаимодействовать с пациентом, роль которого исполняет языковая модель (LLM).
-    """)
-    st.markdown("---")
-
+    st.markdown("Этот симулятор предназначен для тренировки ваших навыков...") # Полный текст инструкций
     col1_intro, col2_intro = st.columns(2)
     with col1_intro:
         st.subheader("🚀 Как начать?")
@@ -434,7 +473,6 @@ elif not st.session_state.get("current_scenario") and not st.session_state.get("
             *   **Следите за триггерами:** Иногда пациент может сообщить новую информацию или его состояние изменится в ответ на ваши действия или по прошествии времени в диалоге.
             *   **Нужна помощь?** Используйте кнопку "Запросить консультацию у коллеги" (штраф к оценке!).
         """)
-
     with col2_intro:
         st.subheader("🎯 Ваши Задачи:")
         st.markdown("""
@@ -459,5 +497,5 @@ elif not st.session_state.get("current_scenario") and not st.session_state.get("
     st.markdown("---")
     st.info("👈 **Для старта выберите или сгенерируйте сценарий в панели слева!**")
 
-if not st.session_state.get("scenario_selected") and not st.session_state.get("current_scenario"):
+if not st.session_state.scenario_selected and not st.session_state.current_scenario:
     st.stop()
