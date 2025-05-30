@@ -1,3 +1,4 @@
+
 import streamlit as st
 import os
 from openai import OpenAI
@@ -52,6 +53,9 @@ except Exception as e:
 # --- Конфигурация и API клиент ---
 load_dotenv()
 KOBOLD_API_URL = os.getenv("KOBOLD_API_URL", "http://localhost:5002/v1/")
+LLM_TIMEOUT_SHORT = 60.0  # seconds for quick responses
+LLM_TIMEOUT_LONG = 300.0 # seconds for long generation/evaluation
+
 try:
     client = OpenAI(base_url=KOBOLD_API_URL, api_key="sk-not-needed")
 except Exception as e:
@@ -87,16 +91,24 @@ def _extract_and_parse_json(raw_text):
     except json.JSONDecodeError as e:
         st.warning(f"Ошибка парсинга извлеченного JSON ('{json_text[:100].strip().replace(chr(10), ' ')}...'): {e.msg}. Попытка восстановления...")
         
+        # Ремонт A: Исправление неправильно закавыченных ключей (например, key": -> "key":)
         try:
-            repaired_text_A = re.sub(r'(?<=[{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)"(\s*:)', r'"\1"\2', json_text)
+            # (?<=[{,]\s*) - lookbehind for '{' or ',' followed by optional whitespace (problematic due to \s*)
+            # ([a-zA-Z_][a-zA-Z0-9_]*) - key name (group 1)
+            # " - misplaced quote
+            # (\s*:) - whitespace and colon (group 2)
+            # Replacement: "\1"\2 -> "key_name":
+            # Fixed regex to avoid variable-width lookbehind:
+            repaired_text_A = re.sub(r'([{,])(\s*)([a-zA-Z_][a-zA-Z0-9_]*)"(\s*:)', r'\1\2"\3"\4', json_text)
             if repaired_text_A != json_text: 
                 st.info("Ремонт A: Попытка исправить ключи с неправильными кавычками (например, 'key\":' -> '\"key\":')...")
                 return json.loads(repaired_text_A) 
         except json.JSONDecodeError as e_fixA:
             st.warning(f"Ремонт A (исправление ключей) не удался или привел к новой ошибке парсинга: {e_fixA.msg}")
-        except Exception as repair_eA:
+        except Exception as repair_eA: # Catch regex errors like "look-behind requires fixed-width pattern" if any remain
             st.warning(f"Неожиданная ошибка во время Ремонта A (исправление ключей): {repair_eA}")
         
+        # Ремонт B: Поиск полного JSON объекта путем балансировки скобок
         try:
             open_braces = 0; valid_json_end = -1; first_brace = json_text.find('{')
             if first_brace == -1: 
@@ -112,7 +124,7 @@ def _extract_and_parse_json(raw_text):
                         json.loads(potential_json) 
                         valid_json_end = actual_index
                     except json.JSONDecodeError:
-                        continue 
+                        continue # Keep searching if this substring is not valid JSON itself
             
             if valid_json_end != -1:
                 repaired_json_text_B = json_text[first_brace : valid_json_end + 1]
@@ -121,6 +133,7 @@ def _extract_and_parse_json(raw_text):
         except Exception as repair_B_e: 
             st.warning(f"Ремонт B (поиск полного объекта) не удался: {repair_B_e}")
 
+        # Ремонт C: Попытка добавить недостающие закрывающие символы
         possible_suffixes = ["}", "]", "}}", "]}", "}]", "\"}", "\"]}", "\"}]", "\"}}", ")}"]; possible_suffixes = list(dict.fromkeys(possible_suffixes)) 
         for suffix_to_add in possible_suffixes:
             try: 
@@ -129,6 +142,30 @@ def _extract_and_parse_json(raw_text):
             except json.JSONDecodeError: 
                 continue
         
+        # Ремонт D: Попытка исправить отсутствующий ключ 'description' в объектах списка 'common_mistakes'
+        # Пример ошибки: { "id": "some_id", "This is a description string.", "penalty": 3 }
+        # Должно быть:   { "id": "some_id", "description": "This is a description string.", "penalty": 3 }
+        try:
+            # (\{\s*"id"\s*:\s*"[^"]*"\s*,\s*) - Group 1: Matches '{ "id": "value", '
+            # ("[^\"]*")                        - Group 2: Matches the string value that's missing its key, e.g., "description text"
+            # (\s*,\s*"penalty"\s*:)           - Group 3: Matches ' , "penalty": '
+            # This regex assumes standard string content without internal escaped quotes for the description for simplicity.
+            pattern_common_mistake_fix = r'(\{\s*"id"\s*:\s*"[^"]*"\s*,\s*)("[^"]*")(\s*,\s*"penalty"\s*:)'
+            
+            # Check if the pattern to fix exists to avoid unnecessary operations
+            if re.search(pattern_common_mistake_fix, json_text):
+                repaired_text_D = re.sub(pattern_common_mistake_fix,
+                                         r'\1"description": \2\3', 
+                                         json_text)
+                if repaired_text_D != json_text: # Ensure a change was made
+                    st.info("Ремонт D: Попытка исправить отсутствующий ключ 'description' в 'common_mistakes'...")
+                    return json.loads(repaired_text_D)
+        except json.JSONDecodeError as e_fixD:
+            st.warning(f"Ремонт D (исправление common_mistakes) не удался или привел к новой ошибке парсинга: {e_fixD.msg}")
+        except Exception as repair_eD:
+            st.warning(f"Неожиданная ошибка во время Ремонта D (исправление common_mistakes): {repair_eD}")
+
+
         original_error_doc = e.doc if hasattr(e, 'doc') and e.doc == json_text else json_text
         original_error_pos = e.pos if hasattr(e, 'pos') else 0
         raise json.JSONDecodeError(f"Не удалось восстановить JSON ('{json_text[:100].strip().replace(chr(10), ' ')}...') после нескольких попыток. Исходная ошибка: {e.msg}",
@@ -148,7 +185,13 @@ def generate_llm_response(messages_history_for_llm, system_prompt_for_llm):
     try:
         messages_to_send = [{"role": "system", "content": system_prompt_for_llm}] + \
                            [msg for msg in messages_history_for_llm if msg["role"] in ["user", "assistant"]]
-        response = client.chat.completions.create(model="local-model", messages=messages_to_send, max_tokens=450, temperature=0.75)
+        response = client.chat.completions.create(
+            model="local-model", 
+            messages=messages_to_send, 
+            max_tokens=450, 
+            temperature=0.75,
+            timeout=LLM_TIMEOUT_SHORT 
+        )
         if response.choices and response.choices[0].message.content:
             return response.choices[0].message.content.strip()
         st.warning("LLM не вернул текстовый ответ для пациента."); return "Пациент задумался и молчит..."
@@ -184,7 +227,8 @@ def get_consultant_response(patient_dialogue_history, user_question_to_consultan
                 {"role": "user", "content": user_content}
             ],
             max_tokens=500,
-            temperature=0.5
+            temperature=0.5,
+            timeout=LLM_TIMEOUT_SHORT
         )
         if response.choices and response.choices[0].message.content:
             return response.choices[0].message.content.strip()
@@ -263,7 +307,13 @@ def generate_new_scenario_via_llm(age_range_str=None, specialization_str=None, g
     raw_text = ""
     try:
         messages_for_scenario_gen = [{"role": "system", "content": system_prompt_for_generator}, {"role": "user", "content": user_prompt_for_generator}]
-        response = client.chat.completions.create(model="local-model", messages=messages_for_scenario_gen, max_tokens=8192, temperature=0.7) # Increased max_tokens for potentially larger JSON
+        response = client.chat.completions.create(
+            model="local-model", 
+            messages=messages_for_scenario_gen, 
+            max_tokens=8192, 
+            temperature=0.7,
+            timeout=LLM_TIMEOUT_LONG
+        )
         if not (response.choices and response.choices[0].message and response.choices[0].message.content):
             st.error("LLM не вернул контент для генерации сценария."); return None
         raw_text = response.choices[0].message.content.strip()
@@ -279,11 +329,10 @@ def generate_new_scenario_via_llm(age_range_str=None, specialization_str=None, g
             "common_mistakes": [{"id": "empty_dx", "description": "Диагноз не был поставлен.", "penalty": 5}, {"id": "empty_plan", "description": "План не был предложен.", "penalty": 5}],
             "key_diagnostic_questions_keywords": [], "correct_diagnosis_keywords_for_check": [], "correct_plan_keywords_for_check": [],
             "available_investigations": {},
-            "physical_exam_findings_prompt_details": { # Ensure defaults for quick actions
+            "physical_exam_findings_prompt_details": { 
                 "temperature": "36.6°C", "blood_pressure": "120/80 мм рт.ст.", "pulse": "70 уд/мин", "spo2": "98%",
                 "auscultation_lungs": "дыхание везикулярное, хрипов нет", "palpation_abdomen": "живот мягкий, безболезненный",
                 "throat_inspection": "зев спокоен, налетов нет",
-                # Defaults for new quick actions
                 "skin_appearance": "Кожные покровы обычной окраски и влажности, высыпаний нет.",
                 "lymph_nodes": "Периферические лимфоузлы не увеличены, безболезненны.",
                 "thyroid_palpation": "Щитовидная железа не увеличена, мягко-эластической консистенции, безболезненна.",
@@ -295,7 +344,7 @@ def generate_new_scenario_via_llm(age_range_str=None, specialization_str=None, g
                 "peripheral_pulses": "Пульсация на периферических артериях удовлетворительная, симметричная.",
                 "ear_inspection": "Наружные слуховые проходы свободны, барабанные перепонки серые, опознавательные знаки четкие.",
                 "nose_inspection": "Слизистая носа розовая, влажная, носовые ходы свободны.",
-                "heart_rate": "ЧСС 70 уд/мин, ритмичный." # Can be redundant with pulse but good to have
+                "heart_rate": "ЧСС 70 уд/мин, ритмичный." 
             },
             "expected_differential_diagnoses": [],
             "communication_focus_points": [], "dynamic_state_triggers": []
@@ -381,7 +430,13 @@ def evaluate_with_llm(scenario_data, user_dialogue_msgs, user_dx, user_plan, use
 
     default_error_result = {"overall_score": 0, "score_breakdown": {}, "general_feedback": {"positive_aspects": [], "areas_for_improvement": ["Произошла ошибка при обработке ответа от LLM-оценщика."]}, "time_management_comment": "Ошибка оценки времени.", "consultation_impact_comment": "Ошибка оценки влияния консультаций."}
     try:
-        response = client.chat.completions.create(model="local-model", messages=[{"role":"system", "content":system_prompt}, {"role":"user", "content":user_prompt}], max_tokens=4000, temperature=0.3)
+        response = client.chat.completions.create(
+            model="local-model", 
+            messages=[{"role":"system", "content":system_prompt}, {"role":"user", "content":user_prompt}], 
+            max_tokens=4000, 
+            temperature=0.3,
+            timeout=LLM_TIMEOUT_LONG
+        )
         if not (response.choices and response.choices[0].message and response.choices[0].message.content):
             st.error("LLM-оценщик не вернул контент."); return default_error_result
         raw_text = response.choices[0].message.content.strip()
@@ -476,7 +531,7 @@ def reset_session_and_rerun():
         "start_with_hints_checkbox",
         "timer_enabled_by_user", "timer_duration_setting"
     ]
-    saved_settings = {k: st.session_state.get(k, default_session_state_values.get(k)) for k in settings_keys} # Use .get for default
+    saved_settings = {k: st.session_state.get(k, default_session_state_values.get(k)) for k in settings_keys} 
     history = st.session_state.get("session_history", [])
 
     for key, value in default_session_state_values.items():
@@ -486,7 +541,7 @@ def reset_session_and_rerun():
         st.session_state[k_saved] = v_saved
 
     st.session_state.session_history = history
-    st.session_state.app_initialized = True
+    st.session_state.app_initialized = True 
     st.rerun()
 
 st.set_page_config(layout="wide", page_title="Виртуальный пациент v2.0");
@@ -540,8 +595,9 @@ with st.sidebar:
 
     if st.button("✨ Сгенерировать новый сценарий (LLM)", use_container_width=True, type="primary"):
         if st.session_state.get("scenario_selected"):
-             reset_session_and_rerun()
-        with st.spinner("LLM генерирует новый сценарий... Пожалуйста, подождите."):
+             reset_session_and_rerun() 
+        
+        with st.spinner("LLM генерирует новый сценарий... Это может занять до 5 минут. Пожалуйста, подождите."):
             new_scenario = generate_new_scenario_via_llm(
                 st.session_state.llm_age,
                 st.session_state.llm_spec,
@@ -553,7 +609,7 @@ with st.sidebar:
             st.session_state.already_offered_training_mode_for_this_eval = False
             st.rerun()
         else:
-            st.error("Не удалось сгенерировать сценарий. Попробуйте еще раз или проверьте настройки LLM.")
+            st.error("Не удалось сгенерировать сценарий. Попробуйте еще раз или проверьте настройки и доступность LLM сервера. Возможно, истек таймаут запроса к LLM.")
 
     st.markdown("---"); st.caption(f"LLM API: {KOBOLD_API_URL.replace('http://localhost', 'local')[:50]}...")
 
@@ -596,7 +652,7 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
     tab_titles = ["Диалог и Действия", "Записная книжка"]
     tab_icons = {"Диалог и Действия": "💬", "Записная книжка": "📝"}
     if st.session_state.evaluation_done: tab_titles.append("Результаты Оценки"); tab_icons["Результаты Оценки"] = "📊"
-    if st.session_state.session_history and st.session_state.evaluation_done : tab_titles.append("История сессий"); tab_icons["История сессий"] = "📚" # Corrected condition
+    if st.session_state.session_history and st.session_state.evaluation_done : tab_titles.append("История сессий"); tab_icons["История сессий"] = "📚" 
     if is_training or st.session_state.evaluation_done: tab_titles.append("Детали Сценария (Подсказки)"); tab_icons["Детали Сценария (Подсказки)"] = "ℹ️"
 
     active_tabs_map = {}
@@ -650,13 +706,14 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                     if time_taken_final is not None:
                          st.session_state.time_taken_for_display = f"{int(time_taken_final//60)}:{int(time_taken_final%60):02d}"
 
-                    eval_results = evaluate_with_llm(scenario, st.session_state.messages,
-                                                st.session_state.user_diagnosis, st.session_state.user_action_plan,
-                                                st.session_state.user_differential_diagnosis,
-                                                time_taken_final,
-                                                (st.session_state.timer_active_in_scenario or st.session_state.timer_expired_flag),
-                                                st.session_state.get("consultations_used_count", 0)
-                                                )
+                    with st.spinner("LLM проводит оценку ваших действий... Это может занять до 5 минут."):
+                        eval_results = evaluate_with_llm(scenario, st.session_state.messages,
+                                                    st.session_state.user_diagnosis, st.session_state.user_action_plan,
+                                                    st.session_state.user_differential_diagnosis,
+                                                    time_taken_final,
+                                                    (st.session_state.timer_active_in_scenario or st.session_state.timer_expired_flag),
+                                                    st.session_state.get("consultations_used_count", 0)
+                                                    )
                     st.session_state.evaluation_results = eval_results
                     if eval_results and "overall_score" in eval_results:
                         st.session_state.session_history.append({
@@ -672,10 +729,9 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                             st.session_state.session_history = st.session_state.session_history[-20:]
 
                     st.session_state.evaluation_done = True
-                    st.session_state.timer_active_in_scenario = False
+                    st.session_state.timer_active_in_scenario = False 
                     st.rerun()
 
-            # --- Consultation Section ---
             st.markdown("---")
             st.subheader("🤝 Консультация со специалистом")
 
@@ -686,7 +742,7 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
 
             if st.session_state.all_consultation_history:
                 with st.expander("История консультаций по этому случаю", expanded=False):
-                    for i, consult_item in enumerate(reversed(st.session_state.all_consultation_history)): # Show latest first
+                    for i, consult_item in enumerate(reversed(st.session_state.all_consultation_history)): 
                         st.markdown(f"**Консультация {len(st.session_state.all_consultation_history) - i} (Специалист: {consult_item['specialist']})**")
                         st.markdown(f"> *Ваш вопрос:* `{consult_item['request']}`")
                         st.markdown(f"> *Ответ консультанта:* {consult_item['response']}")
@@ -712,13 +768,13 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                     )
                     submit_consult_button = st.form_submit_button(
                         "📨 Отправить запрос на консультацию",
-                        disabled=not consult_question.strip() # Button active if text area not empty
+                        disabled=not consult_question.strip() 
                     )
 
                     if submit_consult_button and consult_question.strip():
                         st.session_state.consultations_used_count += 1
 
-                        with st.spinner("Получение ответа от консультанта..."):
+                        with st.spinner("Получение ответа от консультанта... Это может занять до 1 минуты."):
                             main_scenario_info_for_consultant = scenario.get('patient_initial_info_display', 'Информация отсутствует.')
                             consultant_advice = get_consultant_response(
                                 st.session_state.messages,
@@ -748,7 +804,6 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
 
             if not chat_interface_disabled:
                 st.markdown("<small>Быстрые действия (физикальный осмотр):</small>", unsafe_allow_html=True);
-                # Define more quick actions
                 quick_actions_map = {
                     "t°": "Измеряю температуру.", "АД": "Измеряю АД.", "ЧСС": "Измеряю ЧСС.", "SpO2": "Проверяю SpO2.",
                     "Лёгкие": "Слушаю лёгкие.", "Живот": "Пальпирую живот.", "Горло": "Осматриваю горло.",
@@ -757,7 +812,6 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                     "Печень/Сел": "Пальпация печени и селезенки.", "Отеки": "Проверка на отеки.", "Пульс (периф)": "Проверка периферической пульсации.",
                     "Уши": "Осмотр ушей.", "Нос": "Осмотр носа."
                 }
-                # Map quick action labels to potential keys in physical_exam_findings_prompt_details
                 action_to_phys_key_approx = {
                     "t°": ["temperature", "температура"], "ад": ["blood_pressure", "давление", "ад"],
                     "чсс": ["heart_rate", "pulse", "чсс"], "spo2": ["spo2", "сатурация"],
@@ -783,24 +837,23 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                     relevant_quick_actions = list(quick_actions_map.items())
                 else:
                     for label, text_action in quick_actions_map.items():
-                        label_key_for_approx = label.lower().replace('°','deg').replace('ё','е').replace('/','_')
+                        label_key_for_approx = label.lower().replace('°','deg').replace('ё','е').replace('/','_').replace(' (кр)','').replace(' (периф)','')
                         is_relevant = False
-                        potential_direct_keys = action_to_phys_key_approx.get(label_key_for_approx, [label_key_for_approx.replace(" (кр)","").replace(" (периф)","")])
-                        if any(pk.lower() in scenario_phys_exam_keys for pk in potential_direct_keys):
+                        potential_direct_keys = action_to_phys_key_approx.get(label_key_for_approx, [label_key_for_approx])
+                        if any(pk.lower().strip() in scenario_phys_exam_keys for pk in potential_direct_keys):
                             is_relevant = True
                         if is_relevant:
                              relevant_quick_actions.append((label, text_action))
 
-                if not relevant_quick_actions and scenario.get("physical_exam_findings_prompt_details"):
-                    relevant_quick_actions = list(quick_actions_map.items())
-                elif not scenario.get("physical_exam_findings_prompt_details"):
+                if not relevant_quick_actions : 
                      relevant_quick_actions = list(quick_actions_map.items())
 
-                action_buttons_cols = st.columns(4) # Increased columns for more buttons
+
+                action_buttons_cols = st.columns(4) 
                 btn_idx = 0
                 for Rlabel, Rtext_action in relevant_quick_actions:
                     col_to_use = action_buttons_cols[btn_idx % len(action_buttons_cols)]
-                    if col_to_use.button(Rlabel, key=f"quick_action_{Rlabel.replace('°','deg').replace('/','_').replace(' ','_')}", use_container_width=True, help=Rtext_action):
+                    if col_to_use.button(Rlabel, key=f"quick_action_{Rlabel.replace('°','deg').replace('/','_').replace(' ','_').replace('(','').replace(')','')}", use_container_width=True, help=Rtext_action):
                         st.session_state.messages.append({"role": "user", "content": Rtext_action}); st.session_state.current_turn_number += 1
                         st.session_state.user_input_trigger_flag = True; st.rerun()
                     btn_idx += 1
@@ -817,15 +870,15 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                 inv_btn_idx = 0
                 for Ilabel, Itext_action in quick_investigations_map.items():
                     col_to_use_inv = investigation_buttons_cols[inv_btn_idx % len(investigation_buttons_cols)]
-                    if col_to_use_inv.button(Ilabel, key=f"quick_investigation_{Ilabel.replace(' ','_')}", use_container_width=True, help=Itext_action):
+                    if col_to_use_inv.button(Ilabel, key=f"quick_investigation_{Ilabel.replace(' ','_').replace('(','').replace(')','')}", use_container_width=True, help=Itext_action):
                         st.session_state.messages.append({"role": "user", "content": Itext_action})
                         st.session_state.current_turn_number += 1
-                        st.session_state.user_input_trigger_flag = True # To trigger LLM response
+                        st.session_state.user_input_trigger_flag = True 
                         st.rerun()
                     inv_btn_idx +=1
                 st.markdown("---")
 
-            chat_container_height = 360 if not chat_interface_disabled else 520 # Adjusted height
+            chat_container_height = 360 if not chat_interface_disabled else 520 
             with st.container(height=chat_container_height):
                 for msg_idx, msg_item in enumerate(st.session_state.messages):
                     avatar_icon = "🧑‍⚕️" if msg_item["role"] == "user" else "🤒"
@@ -868,7 +921,7 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
                 current_patient_state_modifiers = "\n".join(st.session_state.patient_state_modifiers)
                 final_system_prompt_for_patient = f"{base_persona_prompt}\n{difficulty_modifier}\n{general_simulation_instructions}\n{current_patient_state_modifiers}"
 
-                with st.spinner("Пациент обдумывает ответ..."):
+                with st.spinner("Пациент обдумывает ответ... Это может занять до 1 минуты."):
                     llm_patient_response = generate_llm_response(st.session_state.messages, final_system_prompt_for_patient)
 
                 response_parts_combined = [llm_patient_response]
@@ -899,7 +952,7 @@ if st.session_state.get("current_scenario") and st.session_state.get("scenario_s
             st.subheader("📝 Ваши личные заметки по случаю"); st.caption("Эта информация невидима для пациента и не передается LLM-оценщику.")
             current_notes = st.text_area("Заметки:", value=st.session_state.physician_notes, height=450, key="physician_notes_input_area", help="Здесь вы можете делать любые пометки для себя.")
             if current_notes != st.session_state.physician_notes:
-                st.session_state.physician_notes = current_notes; # No need to rerun just for notes
+                st.session_state.physician_notes = current_notes; 
 
     if "Результаты Оценки" in tab_titles:
         with tabs_rendered[active_tabs_map["Результаты Оценки"]]:
@@ -1025,7 +1078,6 @@ elif not st.session_state.get("current_scenario") and not st.session_state.get("
     initial_tab_titles = ["О приложении", "Готовые сценарии", "История сессий"]
     initial_tab_icons = {"О приложении": "👋", "Готовые сценарии": "📚", "История сессий": "📈"}
     
-    # Create a list of tab specs for st.tabs
     tab_specs = [f"{initial_tab_icons.get(title, '')} {title}" for title in initial_tab_titles]
     welcome_tab, predef_scenarios_tab, history_tab_initial = st.tabs(tab_specs)
 
@@ -1143,7 +1195,6 @@ elif not st.session_state.get("current_scenario") and not st.session_state.get("
         st.subheader("📈 Ваша история пройденных сессий")
         if st.session_state.session_history:
             df_history_display = pd.DataFrame(st.session_state.session_history)
-             # Rename columns for display
             df_history_display.rename(columns={
                 "name": "Название сценария",
                 "score": "Итоговая оценка",
@@ -1152,16 +1203,15 @@ elif not st.session_state.get("current_scenario") and not st.session_state.get("
                 "time_taken": "Затраченное время",
                 "timer_active": "Таймер был активен",
                 "consultations_used": "Использовано консультаций"
-            }, inplace=True, errors='ignore') # Use errors='ignore' if some columns might not exist yet
+            }, inplace=True, errors='ignore') 
 
             expected_cols = ["Название сценария", "Итоговая оценка", "Уровень сложности", "Дата и время", "Затраченное время", "Таймер был активен", "Использовано консультаций"]
             
-            # Ensure all expected columns exist, add if not with default N/A
             for col_name in expected_cols:
                 if col_name not in df_history_display.columns:
                     df_history_display[col_name] = "N/A"
             
-            df_history_display_final = df_history_display[expected_cols] # Reorder/select columns
+            df_history_display_final = df_history_display[expected_cols] 
             st.dataframe(df_history_display_final, hide_index=True, use_container_width=True)
 
             if st.button("🗑️ Очистить историю сессий", key="clear_session_history_button_initial", help="Это действие удалит всю сохраненную историю сессий."):
