@@ -27,7 +27,7 @@
 
 1.  **Клонируйте репозиторий:**
     ```bash
-    git clone https://github.com/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ.git
+    git clone https://github.com/swagerka/virtual-patient
     cd ВАШ_РЕПОЗИТОРИЙ
     ```
 
